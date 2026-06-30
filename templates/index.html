@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MHTML Extractor</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --accent:#5b8cff; --text:#e7e9ee; --muted:#9aa1ad; --ok:#3ddc97; --err:#ff5c5c; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "Segoe UI", Tahoma, sans-serif; background:var(--bg); color:var(--text); display:flex; justify-content:center; padding:40px 16px; }
+  .card { background:var(--card); border-radius:16px; padding:32px; max-width:560px; width:100%; box-shadow:0 10px 30px rgba(0,0,0,.3); }
+  h1 { font-size:22px; margin:0 0 6px; }
+  p.sub { color:var(--muted); margin:0 0 24px; font-size:14px; }
+  .drop { border:2px dashed #3a3f4b; border-radius:12px; padding:32px; text-align:center; cursor:pointer; transition:.2s; }
+  .drop.dragover { border-color: var(--accent); background:#1c2230; }
+  .drop input { display:none; }
+  .drop .icon { font-size:32px; margin-bottom:8px; }
+  .file-info { margin-top:16px; font-size:14px; color:var(--muted); }
+  .bar-wrap { margin-top:20px; background:#262a33; border-radius:8px; overflow:hidden; height:18px; display:none; }
+  .bar { height:100%; width:0%; background:linear-gradient(90deg,var(--accent),#7ea2ff); transition:width .2s; }
+  .status-line { margin-top:10px; font-size:13px; color:var(--muted); display:none; }
+  .btn { margin-top:20px; width:100%; padding:12px; border:none; border-radius:10px; background:var(--accent); color:#fff; font-size:15px; cursor:pointer; }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .result { margin-top:20px; padding:16px; border-radius:10px; background:#11151c; display:none; font-size:14px; line-height:1.8; }
+  .result.ok { border:1px solid var(--ok); }
+  .result.err { border:1px solid var(--err); color:var(--err); }
+  .dl-btn { display:inline-block; margin-top:10px; background:var(--ok); color:#0a0a0a; padding:10px 16px; border-radius:8px; text-decoration:none; font-weight:600; }
+  .stats { color:var(--muted); font-size:13px; margin-top:6px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>📦 MHTML Extractor</h1>
+  <p class="sub">ارفع ملف MHTML واستخرج الصور المضمّنة فيه على شكل ZIP منظم. الحد الأقصى: {{ max_size_mb }}MB</p>
+
+  <div class="drop" id="drop">
+    <div class="icon">⬆️</div>
+    <div>اسحب الملف هنا أو اضغط للاختيار</div>
+    <input type="file" id="fileInput" accept=".mhtml,.mht">
+  </div>
+  <div class="file-info" id="fileInfo"></div>
+
+  <div class="bar-wrap" id="barWrap"><div class="bar" id="bar"></div></div>
+  <div class="status-line" id="statusLine"></div>
+
+  <button class="btn" id="startBtn" disabled>ابدأ الاستخراج</button>
+
+  <div class="result" id="result"></div>
+</div>
+
+<script>
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB — must match server offset math
+let selectedFile = null;
+
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('fileInput');
+const fileInfo = document.getElementById('fileInfo');
+const startBtn = document.getElementById('startBtn');
+const barWrap = document.getElementById('barWrap');
+const bar = document.getElementById('bar');
+const statusLine = document.getElementById('statusLine');
+const result = document.getElementById('result');
+
+drop.addEventListener('click', () => fileInput.click());
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('dragover'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
+drop.addEventListener('drop', e => {
+  e.preventDefault();
+  drop.classList.remove('dragover');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFile(fileInput.files[0]); });
+
+function handleFile(file) {
+  selectedFile = file;
+  fileInfo.textContent = `${file.name} — ${(file.size / (1024*1024)).toFixed(2)} MB`;
+  startBtn.disabled = false;
+  result.style.display = 'none';
+}
+
+function setProgress(pct, text) {
+  barWrap.style.display = 'block';
+  statusLine.style.display = 'block';
+  bar.style.width = pct + '%';
+  statusLine.textContent = text;
+}
+
+startBtn.addEventListener('click', async () => {
+  if (!selectedFile) return;
+  startBtn.disabled = true;
+  result.style.display = 'none';
+  setProgress(0, 'تجهيز الرفع...');
+
+  try {
+    const totalChunks = Math.ceil(selectedFile.size / CHUNK_SIZE);
+    const initRes = await fetch('/api/upload/init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: selectedFile.name, total_size: selectedFile.size, total_chunks: totalChunks })
+    });
+    const initData = await initRes.json();
+    if (!initRes.ok) throw new Error(initData.error || 'فشل بدء الرفع');
+    const jobId = initData.job_id;
+
+    // upload chunks sequentially (keeps memory/CPU predictable on free-tier hosting)
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * CHUNK_SIZE;
+      const chunkBlob = selectedFile.slice(start, start + CHUNK_SIZE);
+      const fd = new FormData();
+      fd.append('job_id', jobId);
+      fd.append('chunk_index', i);
+      fd.append('chunk', chunkBlob);
+      const chunkRes = await fetch('/api/upload/chunk', { method: 'POST', body: fd });
+      const chunkData = await chunkRes.json();
+      if (!chunkRes.ok) throw new Error(chunkData.error || `فشل رفع الجزء ${i+1}`);
+      const pct = Math.round(((i + 1) / totalChunks) * 60); // uploading = 0-60%
+      setProgress(pct, `رفع الملف... ${i+1}/${totalChunks}`);
+    }
+
+    const completeRes = await fetch('/api/upload/complete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: jobId })
+    });
+    const completeData = await completeRes.json();
+    if (!completeRes.ok) throw new Error(completeData.error || 'فشل إنهاء الرفع');
+
+    setProgress(62, 'بدء الاستخراج على السيرفر...');
+    await pollStatus(jobId);
+
+  } catch (err) {
+    showError(err.message || String(err));
+  } finally {
+    startBtn.disabled = false;
+  }
+});
+
+async function pollStatus(jobId) {
+  while (true) {
+    await new Promise(r => setTimeout(r, 800));
+    const res = await fetch(`/api/status/${jobId}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'تعذر متابعة الحالة');
+
+    // processing maps to 62-100% on the bar
+    const mappedPct = 62 + Math.round(data.percent * 0.38);
+    setProgress(Math.min(mappedPct, 100), data.message || '');
+
+    if (data.status === 'done') {
+      showSuccess(jobId, data.manifest);
+      return;
+    }
+    if (data.status === 'error') {
+      throw new Error(data.error || 'حدث خطأ أثناء الاستخراج');
+    }
+  }
+}
+
+function showSuccess(jobId, manifest) {
+  result.className = 'result ok';
+  result.style.display = 'block';
+  const stats = manifest && manifest.stats ? manifest.stats : {};
+  result.innerHTML = `
+    ✅ تم الاستخراج بنجاح — ${manifest ? manifest.image_count : ''} صورة
+    <div class="stats">
+      صور موجودة في HTML: ${stats.img_tags_found ?? '-'} |
+      تمت مطابقتها: ${stats.matched_from_html ?? '-'} |
+      أُضيفت احتياطياً: ${stats.fallback_parts_added ?? '-'} |
+      صور غير صالحة تم تجاهلها: ${stats.invalid_images_skipped ?? 0}
+    </div>
+    <a class="dl-btn" href="/api/download/${jobId}">⬇️ تحميل ZIP</a>
+  `;
+}
+
+function showError(msg) {
+  result.className = 'result err';
+  result.style.display = 'block';
+  result.textContent = '❌ ' + msg;
+}
+</script>
+</body>
+</html>
